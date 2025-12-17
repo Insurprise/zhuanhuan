@@ -1,7 +1,7 @@
 /**
  * V2rayN 订阅转 Clash Meta (Mihomo) 转换器
  * 运行在 Cloudflare Workers
- * Fixed: Base64 Decoding Robustness
+ * Fixed: Hysteria2 Parsing & Robustness
  */
 
 export default {
@@ -9,7 +9,6 @@ export default {
     const url = new URL(request.url);
     
     // 1. 获取目标订阅链接
-    // 优先级: URL参数 > 环境变量
     const targetUrl = url.searchParams.get('url') || url.searchParams.get('target') || env.V2RAY_URL;
 
     if (!targetUrl) {
@@ -23,7 +22,7 @@ export default {
       // 2. 请求原始订阅数据
       const subRes = await fetch(targetUrl, {
         headers: {
-          'User-Agent': 'v2rayNG/1.8.5',
+          'User-Agent': 'v2rayNG/1.8.5', // 模拟 v2rayNG 客户端
         },
       });
 
@@ -60,11 +59,13 @@ export default {
             proxy = parseTrojan(trimLine);
           } else if (trimLine.startsWith('ss://')) {
             proxy = parseSS(trimLine);
-          } else if (trimLine.startsWith('hy2://')) {
+          } else if (trimLine.startsWith('hy2://') || trimLine.startsWith('hysteria2://')) {
+            // 新增 hysteria2:// 支持
             proxy = parseHysteria2(trimLine);
           }
         } catch (e) {
-          console.error(`解析单行失败: ${line.substring(0, 20)}...`, e);
+          // 仅打印错误，不中断整个流程
+          console.error(`解析单行失败: ${line.substring(0, 50)}...`, e);
         }
 
         if (proxy) {
@@ -105,45 +106,26 @@ export default {
 
 function safeBase64Decode(str) {
   if (!str) return '';
-  
-  // 移除首尾空白
   str = str.trim();
-
-  // 检查是否是 HTML (通常意味着订阅链接错误或需要登录)
   if (str.toLowerCase().startsWith('<!doctype') || str.toLowerCase().startsWith('<html')) {
-    throw new Error("订阅链接返回了 HTML 页面而非订阅数据。请检查链接是否过期或是否需要登录。");
+    throw new Error("订阅链接返回了 HTML 页面而非订阅数据。");
   }
-
-  // 检查是否已经是明文 (有些订阅直接返回 vmess://... 列表)
-  if (str.includes('vmess://') || str.includes('vless://') || str.includes('ss://') || str.includes('trojan://') || str.includes('hy2://')) {
+  if (str.includes('vmess://') || str.includes('vless://') || str.includes('ss://') || str.includes('hy2://') || str.includes('hysteria2://')) {
     return str;
   }
-
-  // 1. 移除所有空白字符 (空格、换行、Tab) - 这是修复 atob error 的关键
   str = str.replace(/\s/g, '');
-
-  // 2. 处理 URL Safe 替换
   str = str.replace(/-/g, '+').replace(/_/g, '/');
-
-  // 3. 补全 Padding
   while (str.length % 4) str += '=';
-
   try {
-    // 4. 解码
     const binaryStr = atob(str);
-    
-    // 5. 尝试 UTF-8 解码 (解决中文乱码)
     try {
       const bytes = new Uint8Array(binaryStr.split('').map(c => c.charCodeAt(0)));
       return new TextDecoder('utf-8').decode(bytes);
     } catch (e) {
-      // 如果 TextDecoder 失败，回退到 escape 方式
       return decodeURIComponent(escape(binaryStr));
     }
   } catch (e) {
-    console.error("Base64 Decode Error:", e);
-    // 如果彻底失败，抛出错误
-    throw new Error("Base64 解码失败，数据格式不正确。");
+    throw new Error("Base64 解码失败");
   }
 }
 
@@ -169,29 +151,32 @@ function parseVmess(line) {
   if (proxy.network === 'ws') {
     proxy['ws-opts'] = {
       path: config.path || '/',
-      headers: {
-        Host: config.host || config.add,
-      },
+      headers: { Host: config.host || config.add },
     };
   } else if (proxy.network === 'grpc') {
-    proxy['grpc-opts'] = {
-      'grpc-service-name': config.path || 'public',
-    };
+    proxy['grpc-opts'] = { 'grpc-service-name': config.path || 'public' };
   }
 
   if (proxy.tls) {
     proxy['servername'] = config.host || config.sni || config.add;
   }
-
   return proxy;
 }
 
 function parseVless(line) {
+  // 手动提取 fragment 以防 URL 解析失败
+  let hash = '';
+  const hashIndex = line.lastIndexOf('#');
+  if (hashIndex !== -1) {
+      hash = line.substring(hashIndex + 1);
+      line = line.substring(0, hashIndex);
+  }
+  
   const url = new URL(line);
   const params = url.searchParams;
 
   const proxy = {
-    name: decodeURIComponent(url.hash.slice(1)) || 'vless-node',
+    name: decodeURIComponent(hash) || 'vless-node',
     type: 'vless',
     server: url.hostname,
     port: parseInt(url.port),
@@ -217,25 +202,27 @@ function parseVless(line) {
   if (proxy.network === 'ws') {
     proxy['ws-opts'] = {
       path: params.get('path') || '/',
-      headers: {
-        Host: params.get('host') || params.get('sni') || url.hostname,
-      },
+      headers: { Host: params.get('host') || params.get('sni') || url.hostname },
     };
   } else if (proxy.network === 'grpc') {
-    proxy['grpc-opts'] = {
-      'grpc-service-name': params.get('serviceName') || '',
-    };
+    proxy['grpc-opts'] = { 'grpc-service-name': params.get('serviceName') || '' };
   }
-
   return proxy;
 }
 
 function parseTrojan(line) {
+  let hash = '';
+  const hashIndex = line.lastIndexOf('#');
+  if (hashIndex !== -1) {
+      hash = line.substring(hashIndex + 1);
+      line = line.substring(0, hashIndex);
+  }
+
   const url = new URL(line);
   const params = url.searchParams;
 
   const proxy = {
-    name: decodeURIComponent(url.hash.slice(1)) || 'trojan-node',
+    name: decodeURIComponent(hash) || 'trojan-node',
     type: 'trojan',
     server: url.hostname,
     port: parseInt(url.port),
@@ -249,30 +236,24 @@ function parseTrojan(line) {
   if (proxy.network === 'ws') {
     proxy['ws-opts'] = {
       path: params.get('path') || '/',
-      headers: {
-        Host: params.get('host') || proxy.sni,
-      },
+      headers: { Host: params.get('host') || proxy.sni },
     };
   } else if (proxy.network === 'grpc') {
-    proxy['grpc-opts'] = {
-      'grpc-service-name': params.get('serviceName') || '',
-    };
+    proxy['grpc-opts'] = { 'grpc-service-name': params.get('serviceName') || '' };
   }
-
   return proxy;
 }
 
 function parseSS(line) {
   let raw = line.replace('ss://', '');
   let name = '';
-  if (raw.includes('#')) {
-    const parts = raw.split('#');
-    raw = parts[0];
-    name = decodeURIComponent(parts[1]);
+  const hashIndex = raw.lastIndexOf('#');
+  if (hashIndex !== -1) {
+      name = decodeURIComponent(raw.substring(hashIndex + 1));
+      raw = raw.substring(0, hashIndex);
   }
 
   let userinfo, server, port;
-  
   if (raw.includes('@')) {
     const parts = raw.split('@');
     userinfo = safeBase64Decode(parts[0]);
@@ -302,11 +283,27 @@ function parseSS(line) {
 }
 
 function parseHysteria2(line) {
+  // 1. 手动分离 Name (Hash) 以防止 URL 解析错误
+  let name = 'hy2-node';
+  const hashIndex = line.lastIndexOf('#');
+  if (hashIndex !== -1) {
+    name = decodeURIComponent(line.substring(hashIndex + 1));
+    line = line.substring(0, hashIndex); // 移除 hash 部分给 URL 解析
+  }
+
+  // 2. 兼容 hysteria2:// 前缀
+  if (line.startsWith('hy2://')) {
+     // standard
+  } else if (line.startsWith('hysteria2://')) {
+     line = line.replace('hysteria2://', 'hy2://'); // URL 类可能不识别 hysteria2 协议头，统一转为 hy2 或 https 处理
+  }
+
   const url = new URL(line);
   const params = url.searchParams;
 
+  // 3. 构建 Clash Meta 代理对象
   const proxy = {
-    name: decodeURIComponent(url.hash.slice(1)) || 'hy2-node',
+    name: name,
     type: 'hysteria2',
     server: url.hostname,
     port: parseInt(url.port),
@@ -316,9 +313,16 @@ function parseHysteria2(line) {
     udp: true
   };
 
+  // 4. 处理混淆 (Obfs)
+  // 标准参数是 obfs 和 obfs-password
   if (params.get('obfs')) {
     proxy.obfs = params.get('obfs');
     proxy['obfs-password'] = params.get('obfs-password');
+  }
+
+  // 5. 处理 ALPN (Clash Meta 有时需要)
+  if (params.get('alpn')) {
+    proxy.alpn = params.get('alpn').split(',');
   }
 
   return proxy;
