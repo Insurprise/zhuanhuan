@@ -1,6 +1,7 @@
 /**
  * V2rayN 订阅转 Clash Meta (Mihomo) 转换器
  * 运行在 Cloudflare Workers
+ * Fixed: Base64 Decoding Robustness
  */
 
 export default {
@@ -9,7 +10,6 @@ export default {
     
     // 1. 获取目标订阅链接
     // 优先级: URL参数 > 环境变量
-    // 环境变量名: V2RAY_URL
     const targetUrl = url.searchParams.get('url') || url.searchParams.get('target') || env.V2RAY_URL;
 
     if (!targetUrl) {
@@ -21,7 +21,6 @@ export default {
 
     try {
       // 2. 请求原始订阅数据
-      // 伪装成 v2rayNG 获取数据，通常能获得更全的节点信息
       const subRes = await fetch(targetUrl, {
         headers: {
           'User-Agent': 'v2rayNG/1.8.5',
@@ -34,30 +33,38 @@ export default {
 
       const subText = await subRes.text();
       
-      // 3. Base64 解码并分割行
-      const decodedText = safeBase64Decode(subText);
+      // 3. 安全解码
+      let decodedText;
+      try {
+        decodedText = safeBase64Decode(subText);
+      } catch (e) {
+        return new Response(`解析订阅内容失败: ${e.message}`, { status: 500 });
+      }
+
+      // 4. 按行分割
       const lines = decodedText.split(/\r?\n/).filter(l => l && l.trim() !== '');
 
-      // 4. 解析节点
+      // 5. 解析节点
       const proxies = [];
       const names = [];
 
       for (const line of lines) {
         let proxy = null;
         try {
-          if (line.startsWith('vmess://')) {
-            proxy = parseVmess(line);
-          } else if (line.startsWith('vless://')) {
-            proxy = parseVless(line);
-          } else if (line.startsWith('trojan://')) {
-            proxy = parseTrojan(line);
-          } else if (line.startsWith('ss://')) {
-            proxy = parseSS(line);
-          } else if (line.startsWith('hy2://')) {
-            proxy = parseHysteria2(line);
+          const trimLine = line.trim();
+          if (trimLine.startsWith('vmess://')) {
+            proxy = parseVmess(trimLine);
+          } else if (trimLine.startsWith('vless://')) {
+            proxy = parseVless(trimLine);
+          } else if (trimLine.startsWith('trojan://')) {
+            proxy = parseTrojan(trimLine);
+          } else if (trimLine.startsWith('ss://')) {
+            proxy = parseSS(trimLine);
+          } else if (trimLine.startsWith('hy2://')) {
+            proxy = parseHysteria2(trimLine);
           }
         } catch (e) {
-          console.error(`解析失败: ${line.substring(0, 20)}...`, e);
+          console.error(`解析单行失败: ${line.substring(0, 20)}...`, e);
         }
 
         if (proxy) {
@@ -74,17 +81,17 @@ export default {
       }
 
       if (proxies.length === 0) {
-        return new Response("未找到有效的节点或解析失败。", { status: 400 });
+        return new Response("未找到有效的节点。请检查订阅链接是否正确，或订阅是否已过期。", { status: 400 });
       }
 
-      // 5. 生成 Clash YAML
+      // 6. 生成 Clash YAML
       const yaml = generateClashYaml(proxies, names);
 
       return new Response(yaml, {
         headers: {
           'content-type': 'text/yaml; charset=utf-8',
           'content-disposition': `attachment; filename="clash-meta-${Date.now()}.yaml"`,
-          'profile-update-interval': '24', // 建议客户端24小时更新一次
+          'profile-update-interval': '24',
         },
       });
 
@@ -95,6 +102,50 @@ export default {
 };
 
 // --- 解析逻辑 ---
+
+function safeBase64Decode(str) {
+  if (!str) return '';
+  
+  // 移除首尾空白
+  str = str.trim();
+
+  // 检查是否是 HTML (通常意味着订阅链接错误或需要登录)
+  if (str.toLowerCase().startsWith('<!doctype') || str.toLowerCase().startsWith('<html')) {
+    throw new Error("订阅链接返回了 HTML 页面而非订阅数据。请检查链接是否过期或是否需要登录。");
+  }
+
+  // 检查是否已经是明文 (有些订阅直接返回 vmess://... 列表)
+  if (str.includes('vmess://') || str.includes('vless://') || str.includes('ss://') || str.includes('trojan://') || str.includes('hy2://')) {
+    return str;
+  }
+
+  // 1. 移除所有空白字符 (空格、换行、Tab) - 这是修复 atob error 的关键
+  str = str.replace(/\s/g, '');
+
+  // 2. 处理 URL Safe 替换
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+
+  // 3. 补全 Padding
+  while (str.length % 4) str += '=';
+
+  try {
+    // 4. 解码
+    const binaryStr = atob(str);
+    
+    // 5. 尝试 UTF-8 解码 (解决中文乱码)
+    try {
+      const bytes = new Uint8Array(binaryStr.split('').map(c => c.charCodeAt(0)));
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch (e) {
+      // 如果 TextDecoder 失败，回退到 escape 方式
+      return decodeURIComponent(escape(binaryStr));
+    }
+  } catch (e) {
+    console.error("Base64 Decode Error:", e);
+    // 如果彻底失败，抛出错误
+    throw new Error("Base64 解码失败，数据格式不正确。");
+  }
+}
 
 function parseVmess(line) {
   const b64 = line.replace('vmess://', '');
@@ -128,7 +179,6 @@ function parseVmess(line) {
     };
   }
 
-  // SNI 处理
   if (proxy.tls) {
     proxy['servername'] = config.host || config.sni || config.add;
   }
@@ -137,7 +187,6 @@ function parseVmess(line) {
 }
 
 function parseVless(line) {
-  // 格式: vless://uuid@host:port?params#name
   const url = new URL(line);
   const params = url.searchParams;
 
@@ -151,10 +200,9 @@ function parseVless(line) {
     tls: params.get('security') === 'tls' || params.get('security') === 'reality',
     'skip-cert-verify': true,
     network: params.get('type') || 'tcp',
-    flow: params.get('flow') || undefined, // xtls-rprx-vision
+    flow: params.get('flow') || undefined,
   };
 
-  // Reality 特有配置
   if (params.get('security') === 'reality') {
     proxy['reality-opts'] = {
       'public-key': params.get('pbk'),
@@ -166,7 +214,6 @@ function parseVless(line) {
     proxy['servername'] = params.get('sni') || params.get('host') || url.hostname;
   }
 
-  // Transport 配置
   if (proxy.network === 'ws') {
     proxy['ws-opts'] = {
       path: params.get('path') || '/',
@@ -216,8 +263,6 @@ function parseTrojan(line) {
 }
 
 function parseSS(line) {
-  // 简单处理 SS (通常格式 ss://base64(method:password)@server:port#name)
-  // 或 ss://base64(method:password@server:port)#name
   let raw = line.replace('ss://', '');
   let name = '';
   if (raw.includes('#')) {
@@ -236,7 +281,6 @@ function parseSS(line) {
     port = parseInt(serverPart[1]);
   } else {
     const decoded = safeBase64Decode(raw);
-    // method:pass@server:port
     const parts = decoded.split('@');
     userinfo = parts[0];
     const serverPart = parts[1].split(':');
@@ -258,7 +302,6 @@ function parseSS(line) {
 }
 
 function parseHysteria2(line) {
-  // 格式: hy2://password@host:port?params#name
   const url = new URL(line);
   const params = url.searchParams;
 
@@ -281,23 +324,7 @@ function parseHysteria2(line) {
   return proxy;
 }
 
-// --- 辅助函数 ---
-
-function safeBase64Decode(str) {
-  // 修复常见的 URL Safe Base64 格式问题
-  str = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (str.length % 4) str += '=';
-  
-  try {
-    // 简单处理中文编码问题
-    return decodeURIComponent(escape(atob(str)));
-  } catch (e) {
-    return atob(str); // Fallback
-  }
-}
-
 function generateClashYaml(proxies, names) {
-  // 基础模板
   const yamlHead = `
 port: 7890
 socks-port: 7891
